@@ -11,6 +11,8 @@ import torch.optim as optim
 import pickle
 import time
 from tqdm import tqdm
+from scipy import sparse as sp
+from scipy.sparse.linalg import norm 
 
 
 
@@ -23,10 +25,12 @@ out_dir = 'out/molecules_graph_regression/'
 
 
 
-def MAE(scores, targets):
-    MAE = F.l1_loss(scores, targets)
-    MAE = MAE.detach().item()
-    return MAE
+def MAE(scores1, scores2, targets):
+    MAE1 = F.l1_loss(scores1, targets)
+    MAE2 = F.l1_loss(scores2, targets)
+    MAE1 = MAE1.detach().item()
+    MAE2 = MAE2.detach().item()
+    return (MAE1+MAE2)/2
 
 
 def set_all_params(dataset, MODEL_NAME, random_seed):
@@ -51,8 +55,8 @@ def set_all_params(dataset, MODEL_NAME, random_seed):
            
 
     if MODEL_NAME == 'GatedGCN':
-        seed=random_seed; epochs=1000; batch_size=5; init_lr=0.001; lr_reduce_factor=0.5; lr_schedule_patience=10; min_lr =0.00001; weight_decay=0
-        L=16; hidden_dim=70; out_dim=hidden_dim; dropout=0.0; readout='mean'; max_time=24;
+        seed=random_seed; epochs=1000; batch_size=5; init_lr=0.001; lr_reduce_factor=0.5; lr_schedule_patience=10; min_lr =0.00001; weight_decay=0.0001
+        L=8; hidden_dim=70; out_dim=hidden_dim; dropout=0.3; readout='mean'; max_time=24;
 
     
 
@@ -69,11 +73,11 @@ def set_all_params(dataset, MODEL_NAME, random_seed):
     
     net_params['n_heads'] = n_heads
     net_params['L'] = L  # min L should be 2
-    net_params['readout'] = "sum"
+    net_params['readout'] = "mean"
     net_params['layer_norm'] = True
     net_params['batch_norm'] = True
-    net_params['in_feat_dropout'] = 0.0
-    net_params['dropout'] = 0.0
+    net_params['in_feat_dropout'] = 0.3
+    net_params['dropout'] = 0.3
     net_params['edge_feat'] = edge_feat
     net_params['self_loop'] = self_loop
 
@@ -156,12 +160,7 @@ class MoleculeDataset(torch.utils.data.Dataset):
         
         return batched_graph, labels
 
-    def _add_positional_encodings(self, pos_enc_dim):
-        
-        # Graph positional encoding v/ Laplacian eigenvectors
-        self.train.graph_lists = [positional_encoding(g, pos_enc_dim) for g in self.train.graph_lists]
-        self.val.graph_lists = [positional_encoding(g, pos_enc_dim) for g in self.val.graph_lists]
-        self.test.graph_lists = [positional_encoding(g, pos_enc_dim) for g in self.test.graph_lists]
+
 
 class MLPReadout(nn.Module):
 
@@ -337,6 +336,9 @@ class GatedGCNNet(nn.Module):
         self.device = net_params['device']
         self.pos_enc = net_params['pos_enc']
         self.hidden_dim = hidden_dim
+        self.alpha_loss = 0.5
+        self.lambda_loss = 0.5
+        self.g = None
         if self.pos_enc:
             pos_enc_dim = net_params['pos_enc_dim']
             self.embedding_pos_enc = nn.Linear(pos_enc_dim, hidden_dim)
@@ -381,21 +383,33 @@ class GatedGCNNet(nn.Module):
         for conv in self.layers:
             h, e, f = conv(g, h, e, f)
         g.ndata['h'] = h
+        g.ndata['f'] = f
         
         if self.readout == "sum":
             hg = dgl.sum_nodes(g, 'h')
+            fg = dgl.mean_nodes(g, 'f')  # default readout is mean nodes
+
         elif self.readout == "max":
             hg = dgl.max_nodes(g, 'h')
+            fg = dgl.mean_nodes(g, 'f')  # default readout is mean nodes
+            
         elif self.readout == "mean":
             hg = dgl.mean_nodes(g, 'h')
+            fg = dgl.mean_nodes(g, 'f')
         else:
             hg = dgl.mean_nodes(g, 'h')  # default readout is mean nodes
-            
-        return self.MLP_layer(hg)
+            fg = dgl.mean_nodes(g, 'f')  # default readout is mean nodes
+        self.g = g    
+        return self.MLP_layer(hg), self.MLP_layer(fg)
         
-    def loss(self, scores, targets):
+    def loss(self, scores1, scores2, targets):
         # loss = nn.MSELoss()(scores,targets)
-        loss = nn.L1Loss()(scores, targets)
+        loss_a = nn.L1Loss()(scores1, targets)
+        loss_b = nn.L1Loss()(scores2, targets)
+
+        loss = (loss_a + loss_b)/2
+
+        
         return loss
 
 
@@ -419,12 +433,12 @@ def train_epoch_sparse(model, optimizer, device, data_loader, epoch):
 
 
         optimizer.zero_grad()
-        batch_scores = model.forward(batch_graphs, batch_x, batch_e, batch_f)
-        loss = model.loss(batch_scores, batch_targets)
+        batch_scores1, atch_scores2 = model.forward(batch_graphs, batch_x, batch_e, batch_f)
+        loss = model.loss(batch_scores1, atch_scores2, batch_targets)
         loss.backward()
         optimizer.step()
         epoch_loss += loss.detach().item()
-        epoch_train_mae += MAE(batch_scores, batch_targets)
+        epoch_train_mae += MAE(batch_scores1, atch_scores2, batch_targets)
         nb_data += batch_targets.size(0)
     epoch_loss /= (iter + 1)
     epoch_train_mae /= (iter + 1)
@@ -445,10 +459,10 @@ def evaluate_network_sparse(model, device, data_loader, epoch):
             batch_targets = batch_targets.to(device)
             
 
-            batch_scores = model.forward(batch_graphs, batch_x, batch_e, batch_f)
-            loss = model.loss(batch_scores, batch_targets)
+            batch_scores1, atch_scores2 = model.forward(batch_graphs, batch_x, batch_e, batch_f)
+            loss = model.loss(batch_scores1, atch_scores2, batch_targets)
             epoch_test_loss += loss.detach().item()
-            epoch_test_mae += MAE(batch_scores, batch_targets)
+            epoch_test_mae += MAE(batch_scores1, atch_scores2, batch_targets)
             nb_data += batch_targets.size(0)
         epoch_test_loss /= (iter + 1)
         epoch_test_mae /= (iter + 1)
@@ -535,7 +549,7 @@ scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
                                                     patience=params['lr_schedule_patience'],
                                                     verbose=True)
 
-for epoch in tqdm(range(1)):
+for epoch in tqdm(range(10)):
     epoch_train_loss, epoch_train_mae, optimizer = train_epoch_sparse(model, optimizer, device, train_loader, epoch)
     epoch_val_loss, epoch_val_mae = evaluate_network_sparse(model, device, val_loader, epoch)
     epoch_test_loss, epoch_test_mae = evaluate_network_sparse(model, device, test_loader, epoch)
